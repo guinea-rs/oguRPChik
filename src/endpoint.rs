@@ -10,6 +10,9 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Longest a single attempt inside [`Endpoint::connect_ready`] may take.
+pub const CONNECT_ATTEMPT_LIMIT: Duration = Duration::from_secs(1);
+
 #[derive(Debug, Clone)]
 pub enum Endpoint {
     Vsock { target: VsockTarget, port: u32 },
@@ -98,21 +101,37 @@ impl Endpoint {
         }
     }
 
+    /// Retries [`connect`](Self::connect) until it succeeds or `give_up_after` has passed.
+    ///
+    /// Each attempt is cut off after at most [`CONNECT_ATTEMPT_LIMIT`]: a Hyper-V
+    /// socket connecting to a port nobody listens on yet does not fail until its
+    /// own 30-second timeout, so an uncut attempt would outlast the service
+    /// starting to listen.
     pub async fn connect_ready(&self, give_up_after: Duration) -> Result<Conn, TransportError> {
         let start = std::time::Instant::now();
         let mut delay = Duration::from_millis(50);
         loop {
-            match self.connect().await {
-                Ok(conn) => return Ok(conn),
-                Err(report) => {
-                    if start.elapsed() + delay >= give_up_after {
-                        return Err(report
-                            .attach(format!("endpoint {self}"))
-                            .attach("gave up waiting for the service to become ready"));
-                    }
-                    compio::time::sleep(delay).await;
-                    delay = (delay * 2).min(Duration::from_secs(1));
-                }
+            let limit = give_up_after
+                .saturating_sub(start.elapsed())
+                .min(CONNECT_ATTEMPT_LIMIT);
+            let (report, cut_off) = match compio::time::timeout(limit, self.connect()).await {
+                Ok(Ok(conn)) => return Ok(conn),
+                Ok(Err(report)) => (report, false),
+                Err(_) => (
+                    Report::new(TransportError::Connect)
+                        .attach(format!("connect attempt cut off after {limit:?}")),
+                    true,
+                ),
+            };
+            let pause = if cut_off { Duration::ZERO } else { delay };
+            if start.elapsed() + pause >= give_up_after {
+                return Err(report
+                    .attach(format!("endpoint {self}"))
+                    .attach("gave up waiting for the service to become ready"));
+            }
+            if !cut_off {
+                compio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(1));
             }
         }
     }
@@ -248,5 +267,14 @@ mod tests {
         let listener = listener_task.await.unwrap();
         let server = listener.accept().await.expect("accept failed");
         assert_eq!(server.kind(), "tcp");
+    }
+
+    #[compio::test]
+    async fn connect_ready_keeps_to_its_budget_when_an_attempt_hangs() {
+        let unroutable = Endpoint::Tcp("192.0.2.1:9".parse().unwrap());
+        let start = std::time::Instant::now();
+        let result = unroutable.connect_ready(Duration::from_millis(1500)).await;
+        assert!(result.is_err());
+        assert!(start.elapsed() < Duration::from_millis(2500), "{:?}", start.elapsed());
     }
 }
