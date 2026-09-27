@@ -15,7 +15,7 @@ use std::io::Cursor;
 use std::rc::Rc;
 use std::time::Duration;
 
-const HANDSHAKE_VERSION: u16 = 2;
+const HANDSHAKE_VERSION: u16 = 3;
 const NONCE_LEN: usize = 32;
 const HMAC_LABEL: &[u8] = b"ogurpchik/handshake/v1";
 
@@ -67,19 +67,67 @@ impl HandshakeMode {
     }
 }
 
-/// Identity of the application schema both sides were built against.
+/// The application protocol one side speaks: which one, and which version of it.
 ///
-/// Opaque to this crate: the application supplies it (typically a hash of its
-/// `.capnp` files) and the handshake refuses to proceed when the two sides
-/// differ. Not checked in [`HandshakeMode::Disabled`], which skips the
-/// handshake entirely.
+/// `id` names the protocol and never changes; the id of its `.capnp` file is
+/// the natural choice. The handshake refuses a peer whose `id` or major
+/// version differs. A different minor or patch connects, and each side learns
+/// the other's version, so it can tell which additions the peer has.
+/// Not checked in [`HandshakeMode::Disabled`], which skips the handshake entirely.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SchemaId(pub u64);
+pub struct Protocol {
+    pub id: u64,
+    pub version: Version,
+}
 
-impl fmt::Display for SchemaId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:016x}", self.0)
+impl Protocol {
+    pub const fn new(id: u64, major: u32, minor: u32, patch: u32) -> Self {
+        Self {
+            id,
+            version: Version {
+                major,
+                minor,
+                patch,
+            },
+        }
     }
+}
+
+impl fmt::Display for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x} v{}", self.id, self.version)
+    }
+}
+
+/// Semantic version of a [`Protocol`]. Peers are compatible when the majors match,
+/// including major 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Version {
+    pub major: u32,
+    pub minor: u32,
+    pub patch: u32,
+}
+
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+fn incompatibility(local: Protocol, peer: Protocol) -> Option<(HandshakeError, String)> {
+    if peer.id != local.id {
+        return Some((
+            HandshakeError::ProtocolMismatch,
+            format!("peer speaks protocol {peer}, this side {local}"),
+        ));
+    }
+    if peer.version.major != local.version.major {
+        return Some((
+            HandshakeError::IncompatibleVersion,
+            format!("peer speaks v{}, this side v{}", peer.version, local.version),
+        ));
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -146,13 +194,15 @@ impl Drop for ConnectionLease {
     }
 }
 
+/// Runs the server half of the handshake and returns the client's protocol version,
+/// or `None` in [`HandshakeMode::Disabled`].
 pub async fn authenticate_server(
     conn: &mut Conn,
     mode: &HandshakeMode,
-    schema: SchemaId,
-) -> Result<(), HandshakeError> {
+    protocol: Protocol,
+) -> Result<Option<Version>, HandshakeError> {
     if matches!(mode, HandshakeMode::Disabled) {
-        return Ok(());
+        return Ok(None);
     }
 
     let attested_pid = match mode {
@@ -171,7 +221,7 @@ pub async fn authenticate_server(
         Report::new(HandshakeError::Io).attach(format!("failed to generate nonce: {e}"))
     })?;
 
-    write_packet(conn, &encode_hello(mode.scheme_id(), schema, &nonce)).await?;
+    write_packet(conn, &encode_hello(mode.scheme_id(), protocol, &nonce)).await?;
     let auth_body = read_packet_with_timeout(conn).await?;
 
     if let Some(client_version) = packet_version(&auth_body)
@@ -184,7 +234,7 @@ pub async fn authenticate_server(
         return Err(Report::new(HandshakeError::UnsupportedVersion).attach(reason));
     }
 
-    let (scheme, client_schema, proof) = decode_client_auth(&auth_body)?;
+    let (scheme, client_protocol, proof) = decode_client_auth(&auth_body)?;
 
     if scheme != mode.scheme_id() {
         let reason = format!(
@@ -195,10 +245,9 @@ pub async fn authenticate_server(
         return Err(Report::new(HandshakeError::SchemeMismatch).attach(reason));
     }
 
-    if client_schema != schema {
-        let reason = format!("application schema mismatch: client={client_schema} server={schema}");
+    if let Some((error, reason)) = incompatibility(protocol, client_protocol) {
         let _ = write_packet(conn, &encode_ack(ACK_REJECTED, reason.as_bytes())).await;
-        return Err(Report::new(HandshakeError::SchemaMismatch).attach(reason));
+        return Err(Report::new(error).attach(reason));
     }
 
     match mode {
@@ -228,21 +277,25 @@ pub async fn authenticate_server(
         _ => {}
     }
 
-    write_packet(conn, &encode_ack(ACK_OK, &[])).await
+    write_packet(conn, &encode_ack(ACK_OK, &[])).await?;
+    Ok(Some(client_protocol.version))
 }
 
+/// Runs the client half of the handshake and returns the server's protocol version,
+/// or `None` in [`HandshakeMode::Disabled`].
 pub async fn authenticate_client(
     conn: &mut Conn,
     mode: &HandshakeMode,
-    schema: SchemaId,
-) -> Result<(), HandshakeError> {
+    protocol: Protocol,
+) -> Result<Option<Version>, HandshakeError> {
     if matches!(mode, HandshakeMode::Disabled) {
-        return Ok(());
+        return Ok(None);
     }
 
     let hello_body = read_packet_with_timeout(conn).await?;
     if hello_body.first() == Some(&TAG_ACK) {
-        return decode_ack(&hello_body);
+        decode_ack(&hello_body)?;
+        return Err(malformed("hello"));
     }
 
     if let Some(server_version) = packet_version(&hello_body)
@@ -252,7 +305,7 @@ pub async fn authenticate_client(
             .attach(format!("server={server_version} client={HANDSHAKE_VERSION}")));
     }
 
-    let (scheme, server_schema, nonce) = decode_hello(&hello_body)?;
+    let (scheme, server_protocol, nonce) = decode_hello(&hello_body)?;
 
     if scheme != mode.scheme_id() {
         return Err(Report::new(HandshakeError::SchemeMismatch)
@@ -266,15 +319,15 @@ pub async fn authenticate_client(
             .to_vec(),
         _ => Vec::new(),
     };
-    write_packet(conn, &encode_client_auth(scheme, schema, &proof)).await?;
+    write_packet(conn, &encode_client_auth(scheme, protocol, &proof)).await?;
 
-    if server_schema != schema {
-        return Err(Report::new(HandshakeError::SchemaMismatch)
-            .attach(format!("server={server_schema} client={schema}")));
+    if let Some((error, reason)) = incompatibility(protocol, server_protocol) {
+        return Err(Report::new(error).attach(reason));
     }
 
     let ack_body = read_packet_with_timeout(conn).await?;
-    decode_ack(&ack_body)
+    decode_ack(&ack_body)?;
+    Ok(Some(server_protocol.version))
 }
 
 pub async fn reject_connection(conn: &mut Conn, reason: &str) -> Result<(), HandshakeError> {
@@ -337,7 +390,7 @@ struct HelloPacket {
     tag: u8,
     version: u16,
     scheme: u8,
-    schema: u64,
+    protocol: WireProtocol,
     nonce_len: u16,
     #[br(count = nonce_len)]
     nonce: Vec<u8>,
@@ -349,10 +402,36 @@ struct ClientAuthPacket {
     tag: u8,
     version: u16,
     scheme: u8,
-    schema: u64,
+    protocol: WireProtocol,
     proof_len: u16,
     #[br(count = proof_len)]
     proof: Vec<u8>,
+}
+
+#[derive(BinRead, BinWrite)]
+#[brw(little)]
+struct WireProtocol {
+    id: u64,
+    major: u32,
+    minor: u32,
+    patch: u32,
+}
+
+impl From<Protocol> for WireProtocol {
+    fn from(p: Protocol) -> Self {
+        Self {
+            id: p.id,
+            major: p.version.major,
+            minor: p.version.minor,
+            patch: p.version.patch,
+        }
+    }
+}
+
+impl From<WireProtocol> for Protocol {
+    fn from(p: WireProtocol) -> Self {
+        Protocol::new(p.id, p.major, p.minor, p.patch)
+    }
 }
 
 #[derive(BinRead, BinWrite)]
@@ -372,42 +451,42 @@ fn packet_version(body: &[u8]) -> Option<u16> {
     }
 }
 
-fn encode_hello(scheme: u8, schema: SchemaId, nonce: &[u8]) -> Vec<u8> {
+fn encode_hello(scheme: u8, protocol: Protocol, nonce: &[u8]) -> Vec<u8> {
     write_body(&HelloPacket {
         tag: TAG_HELLO,
         version: HANDSHAKE_VERSION,
         scheme,
-        schema: schema.0,
+        protocol: protocol.into(),
         nonce_len: nonce.len() as u16,
         nonce: nonce.to_vec(),
     })
 }
 
-fn decode_hello(body: &[u8]) -> Result<(u8, SchemaId, Vec<u8>), HandshakeError> {
+fn decode_hello(body: &[u8]) -> Result<(u8, Protocol, Vec<u8>), HandshakeError> {
     let packet: HelloPacket = read_body(body, "hello")?;
     if packet.tag != TAG_HELLO {
         return Err(malformed("hello"));
     }
-    Ok((packet.scheme, SchemaId(packet.schema), packet.nonce))
+    Ok((packet.scheme, packet.protocol.into(), packet.nonce))
 }
 
-fn encode_client_auth(scheme: u8, schema: SchemaId, proof: &[u8]) -> Vec<u8> {
+fn encode_client_auth(scheme: u8, protocol: Protocol, proof: &[u8]) -> Vec<u8> {
     write_body(&ClientAuthPacket {
         tag: TAG_CLIENT_AUTH,
         version: HANDSHAKE_VERSION,
         scheme,
-        schema: schema.0,
+        protocol: protocol.into(),
         proof_len: proof.len() as u16,
         proof: proof.to_vec(),
     })
 }
 
-fn decode_client_auth(body: &[u8]) -> Result<(u8, SchemaId, Vec<u8>), HandshakeError> {
+fn decode_client_auth(body: &[u8]) -> Result<(u8, Protocol, Vec<u8>), HandshakeError> {
     let packet: ClientAuthPacket = read_body(body, "client auth")?;
     if packet.tag != TAG_CLIENT_AUTH {
         return Err(malformed("client auth"));
     }
-    Ok((packet.scheme, SchemaId(packet.schema), packet.proof))
+    Ok((packet.scheme, packet.protocol.into(), packet.proof))
 }
 
 fn encode_ack(status: u8, reason: &[u8]) -> Vec<u8> {
@@ -465,7 +544,7 @@ mod tests {
     use super::*;
     use crate::net::Listener;
 
-    const SCHEMA: SchemaId = SchemaId(0x5eed);
+    const SCHEMA: Protocol = Protocol::new(0x5eed, 1, 0, 0);
 
     async fn tcp_pair() -> (Conn, Conn) {
         let listener = Listener::bind_tcp("127.0.0.1:0".parse().unwrap())
@@ -556,29 +635,66 @@ mod tests {
         ));
     }
 
-    #[compio::test]
-    async fn schema_mismatch_is_reported_by_both_sides() {
+    async fn handshake_between(
+        server_protocol: Protocol,
+        client_protocol: Protocol,
+    ) -> (
+        Result<Option<Version>, HandshakeError>,
+        Result<Option<Version>, HandshakeError>,
+    ) {
         let (mut server, mut client) = tcp_pair().await;
         let server_fut = compio::runtime::spawn(async move {
-            authenticate_server(&mut server, &HandshakeMode::version_only(), SchemaId(1)).await
+            authenticate_server(&mut server, &HandshakeMode::version_only(), server_protocol).await
         });
-        let client_err =
-            authenticate_client(&mut client, &HandshakeMode::version_only(), SchemaId(2))
-                .await
-                .expect_err("client must detect the schema mismatch");
-        assert!(matches!(
-            client_err.current_context(),
-            HandshakeError::SchemaMismatch
-        ));
+        let client_result =
+            authenticate_client(&mut client, &HandshakeMode::version_only(), client_protocol).await;
+        (server_fut.await.unwrap(), client_result)
+    }
 
-        let server_err = server_fut
-            .await
-            .unwrap()
-            .expect_err("server must reject the schema mismatch");
-        assert!(matches!(
-            server_err.current_context(),
-            HandshakeError::SchemaMismatch
-        ));
+    #[compio::test]
+    async fn a_different_protocol_is_refused_by_both_sides() {
+        let (server, client) =
+            handshake_between(Protocol::new(1, 1, 0, 0), Protocol::new(2, 1, 0, 0)).await;
+        let client_err = client.expect_err("client must refuse another protocol");
+        assert!(matches!(client_err.current_context(), HandshakeError::ProtocolMismatch));
+        let server_err = server.expect_err("server must refuse another protocol");
+        assert!(matches!(server_err.current_context(), HandshakeError::ProtocolMismatch));
+    }
+
+    #[compio::test]
+    async fn a_different_major_is_refused_by_both_sides() {
+        let (server, client) =
+            handshake_between(Protocol::new(7, 2, 0, 0), Protocol::new(7, 1, 9, 0)).await;
+        let client_err = client.expect_err("client must refuse another major");
+        assert!(matches!(client_err.current_context(), HandshakeError::IncompatibleVersion));
+        let server_err = server.expect_err("server must refuse another major");
+        assert!(matches!(server_err.current_context(), HandshakeError::IncompatibleVersion));
+    }
+
+    #[compio::test]
+    async fn a_different_minor_connects_and_each_side_learns_the_other() {
+        let server_protocol = Protocol::new(7, 1, 3, 1);
+        let client_protocol = Protocol::new(7, 1, 0, 4);
+        let (server, client) = handshake_between(server_protocol, client_protocol).await;
+        assert_eq!(server.expect("server handshake failed"), Some(client_protocol.version));
+        assert_eq!(client.expect("client handshake failed"), Some(server_protocol.version));
+    }
+
+    #[compio::test]
+    async fn major_zero_is_not_special() {
+        let (server, client) =
+            handshake_between(Protocol::new(7, 0, 1, 0), Protocol::new(7, 0, 2, 0)).await;
+        server.expect("server handshake failed");
+        client.expect("client handshake failed");
+    }
+
+    #[test]
+    fn the_protocol_travels_intact() {
+        let protocol = Protocol::new(0xfd5a_69cd_5615_08f1, 3, 14, 15);
+        let (_, decoded, _) = decode_hello(&encode_hello(1, protocol, &[9; NONCE_LEN])).unwrap();
+        assert_eq!(decoded, protocol);
+        let (_, decoded, _) = decode_client_auth(&encode_client_auth(1, protocol, &[])).unwrap();
+        assert_eq!(decoded, protocol);
     }
 
     fn v1_packet(tag: u8, scheme: u8, tail: &[u8]) -> Vec<u8> {

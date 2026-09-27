@@ -1,7 +1,7 @@
 
 use testschema::echo_capnp::echo;
 use ogurpchik::auth::handshake::{
-    ConnectionGate, ConnectionMode, HandshakeMode, SchemaId, authenticate_client,
+    ConnectionGate, ConnectionMode, HandshakeMode, Protocol, authenticate_client,
     authenticate_server, reject_connection,
 };
 use ogurpchik::endpoint::Endpoint;
@@ -26,7 +26,7 @@ impl echo::Server for EchoImpl {
     }
 }
 
-const SCHEMA: SchemaId = SchemaId(0x17);
+const SCHEMA: Protocol = Protocol::new(0x17, 1, 0, 0);
 
 fn hmac() -> HandshakeMode {
     HandshakeMode::hmac(b"integration-secret".to_vec())
@@ -100,25 +100,29 @@ async fn tcp_facade_roundtrip() {
     };
     let endpoint = Endpoint::Tcp(inner.local_addr().unwrap());
 
+    let newer = Protocol::new(SCHEMA.id, 1, 2, 0);
+
     let server_task = compio::runtime::spawn(async move {
         let session = accept_session::<echo::Client, _>(&listener, &hmac(), SCHEMA, EchoImpl)
             .await
             .expect("accept_session failed");
+        assert_eq!(session.peer_version(), Some(newer.version));
         compio::time::timeout(std::time::Duration::from_secs(5), session.wait())
             .await
             .ok();
     });
 
-    let session = connect_session::<echo::Client, _>(&endpoint, &hmac(), SCHEMA, EchoImpl)
+    let session = connect_session::<echo::Client, _>(&endpoint, &hmac(), newer, EchoImpl)
         .await
-        .expect("connect_session failed");
+        .expect("a newer minor must connect");
+    assert_eq!(session.peer_version(), Some(SCHEMA.version));
     assert_eq!(ping(&session, "facade").await, "echo facade");
     drop(session);
     server_task.await.unwrap();
 }
 
 #[compio::test]
-async fn facade_surfaces_schema_mismatch() {
+async fn facade_surfaces_an_incompatible_major() {
     use ogurpchik::rpc::{accept_session, connect_session};
 
     let endpoint = Endpoint::Tcp("127.0.0.1:0".parse().unwrap());
@@ -129,19 +133,20 @@ async fn facade_surfaces_schema_mismatch() {
     let endpoint = Endpoint::Tcp(inner.local_addr().unwrap());
 
     let server_task = compio::runtime::spawn(async move {
-        accept_session::<echo::Client, _>(&listener, &hmac(), SchemaId(1), EchoImpl)
+        accept_session::<echo::Client, _>(&listener, &hmac(), SCHEMA, EchoImpl)
             .await
             .map(drop)
     });
 
-    let err = connect_session::<echo::Client, _>(&endpoint, &hmac(), SchemaId(2), EchoImpl)
+    let next_major = Protocol::new(SCHEMA.id, 2, 0, 0);
+    let err = connect_session::<echo::Client, _>(&endpoint, &hmac(), next_major, EchoImpl)
         .await
         .map(drop)
-        .expect_err("a client built against another schema must not connect");
+        .expect_err("a client on another major must not connect");
     assert!(matches!(err.current_context(), RpcError::Setup));
     assert!(matches!(
         err.downcast_ref::<HandshakeError>(),
-        Some(HandshakeError::SchemaMismatch)
+        Some(HandshakeError::IncompatibleVersion)
     ));
 
     let server_err = server_task
@@ -150,7 +155,7 @@ async fn facade_surfaces_schema_mismatch() {
         .expect_err("the server must refuse it too");
     assert!(matches!(
         server_err.downcast_ref::<HandshakeError>(),
-        Some(HandshakeError::SchemaMismatch)
+        Some(HandshakeError::IncompatibleVersion)
     ));
 }
 

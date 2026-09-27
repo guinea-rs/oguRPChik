@@ -1,11 +1,11 @@
 
 use testschema::echo_capnp::echo;
-use ogurpchik::auth::handshake::{HandshakeMode, SchemaId, authenticate_client, authenticate_server};
+use ogurpchik::auth::handshake::{HandshakeMode, Protocol, authenticate_client, authenticate_server};
 use ogurpchik::net::{Conn, Listener};
 use ogurpchik::rpc::{RpcSession, Side, spawn_session};
 use capnp::capability::Rc;
 
-const SCHEMA: SchemaId = SchemaId(0xbe4c);
+const SCHEMA: Protocol = Protocol::new(0xbe4c, 1, 0, 0);
 
 pub struct EchoImpl;
 

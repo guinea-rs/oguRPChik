@@ -5,7 +5,8 @@ use core::fmt;
 pub enum HandshakeError {
     UnsupportedVersion,
     SchemeMismatch,
-    SchemaMismatch,
+    ProtocolMismatch,
+    IncompatibleVersion,
     InvalidProof,
     Rejected,
     Timeout,
@@ -21,7 +22,10 @@ impl fmt::Display for HandshakeError {
         match self {
             Self::UnsupportedVersion => f.write_str("unsupported handshake version"),
             Self::SchemeMismatch => f.write_str("handshake auth scheme mismatch"),
-            Self::SchemaMismatch => f.write_str("application schema mismatch"),
+            Self::ProtocolMismatch => f.write_str("peer speaks a different protocol"),
+            Self::IncompatibleVersion => {
+                f.write_str("peer speaks an incompatible major version of the protocol")
+            }
             Self::InvalidProof => f.write_str("invalid handshake proof"),
             Self::Rejected => f.write_str("handshake rejected by peer"),
             Self::Timeout => f.write_str("handshake timed out"),

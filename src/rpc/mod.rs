@@ -2,6 +2,7 @@
 mod frame;
 mod network;
 
+use crate::auth::handshake::{Protocol, Version};
 use crate::error::{RpcError, from_capnp_exception};
 use crate::net::Conn;
 use capnp::capability::{Client, FromClientHook, FromServer};
@@ -38,6 +39,7 @@ pub fn default_reader_options() -> ReaderOptions {
 pub struct RpcSession<C: FromClientHook> {
     remote: C,
     driver: JoinHandle<Result<(), capnp::Error>>,
+    peer_version: Option<Version>,
 }
 
 impl<C: FromClientHook> RpcSession<C> {
@@ -45,8 +47,14 @@ impl<C: FromClientHook> RpcSession<C> {
         &self.remote
     }
 
+    /// The protocol version the peer presented in the handshake, or `None` when
+    /// no handshake ran.
+    pub fn peer_version(&self) -> Option<Version> {
+        self.peer_version
+    }
+
     pub async fn wait(self) -> crate::error::Result<(), RpcError> {
-        let Self { remote, driver } = self;
+        let Self { remote, driver, .. } = self;
         drop(remote);
         match driver.await {
             Ok(Ok(())) => Ok(()),
@@ -91,6 +99,7 @@ where
     RpcSession {
         remote,
         driver: compio::runtime::spawn(rpc_system),
+        peer_version: None,
     }
 }
 
@@ -102,7 +111,7 @@ where
 pub async fn accept_session<C, S>(
     listener: &crate::net::Listener,
     mode: &crate::auth::handshake::HandshakeMode,
-    schema: crate::auth::handshake::SchemaId,
+    protocol: Protocol,
     local_bootstrap: S,
 ) -> crate::error::Result<RpcSession<C>, RpcError>
 where
@@ -110,16 +119,18 @@ where
     S: 'static,
 {
     let mut conn = listener.accept().await.change_context(RpcError::Setup)?;
-    crate::auth::handshake::authenticate_server(&mut conn, mode, schema)
+    let peer_version = crate::auth::handshake::authenticate_server(&mut conn, mode, protocol)
         .await
         .change_context(RpcError::Setup)?;
-    Ok(spawn_session(conn, Side::Server, local_bootstrap))
+    let mut session = spawn_session(conn, Side::Server, local_bootstrap);
+    session.peer_version = peer_version;
+    Ok(session)
 }
 
 pub async fn connect_session<C, S>(
     endpoint: &crate::endpoint::Endpoint,
     mode: &crate::auth::handshake::HandshakeMode,
-    schema: crate::auth::handshake::SchemaId,
+    protocol: Protocol,
     local_bootstrap: S,
 ) -> crate::error::Result<RpcSession<C>, RpcError>
 where
@@ -127,16 +138,18 @@ where
     S: 'static,
 {
     let mut conn = endpoint.connect().await.change_context(RpcError::Setup)?;
-    crate::auth::handshake::authenticate_client(&mut conn, mode, schema)
+    let peer_version = crate::auth::handshake::authenticate_client(&mut conn, mode, protocol)
         .await
         .change_context(RpcError::Setup)?;
-    Ok(spawn_session(conn, Side::Client, local_bootstrap))
+    let mut session = spawn_session(conn, Side::Client, local_bootstrap);
+    session.peer_version = peer_version;
+    Ok(session)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::handshake::{HandshakeMode, SchemaId, authenticate_client, authenticate_server};
+    use crate::auth::handshake::{HandshakeMode, authenticate_client, authenticate_server};
     use crate::net::Listener;
     use capnp::capability::Rc;
     use std::cell::RefCell;
@@ -205,7 +218,7 @@ mod tests {
         let mode = || HandshakeMode::hmac(b"secret".to_vec());
 
         let server_task = compio::runtime::spawn(async move {
-            authenticate_server(&mut server_conn, &mode(), SchemaId(7))
+            authenticate_server(&mut server_conn, &mode(), Protocol::new(7, 1, 0, 0))
                 .await
                 .expect("server handshake failed");
             let session = spawn_agent(server_conn, Side::Server, "host");
@@ -215,7 +228,7 @@ mod tests {
                 .expect("server session failed");
         });
 
-        authenticate_client(&mut client_conn, &mode(), SchemaId(7))
+        authenticate_client(&mut client_conn, &mode(), Protocol::new(7, 1, 0, 0))
             .await
             .expect("client handshake failed");
         let session = spawn_agent(client_conn, Side::Client, "agent");

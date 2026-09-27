@@ -1,11 +1,11 @@
 use capnp::capability::Rc;
-use ogurpchik::auth::handshake::{HandshakeMode, SchemaId};
+use ogurpchik::auth::handshake::{HandshakeMode, Protocol};
 use ogurpchik::endpoint::Endpoint;
 use ogurpchik::net::vsock::VsockTarget;
 use ogurpchik::rpc::{accept_session, connect_session};
 use testschema::echo_capnp::echo;
 
-const SCHEMA: SchemaId = SchemaId(0xec40);
+const SCHEMA: Protocol = Protocol::new(0xec40, 1, 0, 0);
 
 struct EchoImpl;
 

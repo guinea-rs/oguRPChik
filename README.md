@@ -26,11 +26,11 @@ interface Echo {
 Server:
 
 ```rust
-use ogurpchik::auth::handshake::{HandshakeMode, SchemaId};
+use ogurpchik::auth::handshake::{HandshakeMode, Protocol};
 use ogurpchik::endpoint::Endpoint;
 use ogurpchik::rpc::accept_session;
 
-const SCHEMA: SchemaId = SchemaId(0x0123_4567_89ab_cdef);
+const SCHEMA: Protocol = Protocol::new(0x0123_4567_89ab_cdef, 1, 0, 0);
 
 let endpoint = Endpoint::for_service("myapp", "echo")?;
 let listener = endpoint.listen().await?;
@@ -59,10 +59,16 @@ req.get().set_msg("hello");
 let reply = req.send().promise.await?;
 ```
 
-`SchemaId` is opaque to this crate — typically a hash of your `.capnp` files
-computed in `build.rs`. Both sides must present the same one or the handshake
-fails with `HandshakeError::SchemaMismatch`, instead of connecting and then
-misreading fields laid out by a different schema revision.
+`Protocol` is a fixed id plus a semantic version. Use the id of your `.capnp`
+file: it never changes. Keep the version by capnp's evolution rules — fields and
+methods appended at the end are a minor bump, anything else that touches the
+wire is a major one.
+
+The handshake refuses a peer with another id (`HandshakeError::ProtocolMismatch`)
+or another major (`HandshakeError::IncompatibleVersion`). A different minor
+connects: capnp ignores what it does not know, a method the peer lacks answers
+`Unimplemented`, and `session.peer_version()` tells you up front which
+additions the peer has.
 
 ## Errors
 
