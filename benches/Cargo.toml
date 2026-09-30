@@ -8,11 +8,11 @@ publish     = false
 ogurpchik = { path = "../" }
 testschema = { path = "../tests/testschema" }
 
-compio       = { version = "0.18.0", features = ["net", "io-compat", "macros", "time"] }
+compio       = { version = "0.19.1", features = ["net", "io-compat", "macros", "time"] }
 capnp        = "0.27"
 futures      = "0.3"
 futures-util = "0.3"
-criterion    = { version = "0.5", features = ["html_reports"] }
+criterion    = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name    = "rpc_latency"
