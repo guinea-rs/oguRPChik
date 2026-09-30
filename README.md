@@ -10,7 +10,7 @@ Used in [uniproc](https://github.com/ignat/uniproc).
 - capnp-rpc for the protocol (your `.capnp` schema is the contract)
 - compio transport: Hyper-V `AF_HYPERV` / Linux vsock, Unix sockets, Windows named pipes, TCP
 - pre-RPC handshake on the raw connection: HMAC or signed-process auth with the peer PID taken from the OS (`GetNamedPipeClientProcessId`, `SO_PEERCRED`), never from the wire
-- discovery by convention: `\\.\pipe\<app>.<service>`, `$XDG_RUNTIME_DIR/<app>/<service>.sock`, per-service vsock port
+- discovery by convention: `\\.\pipe\<app>.<service>`, `$XDG_RUNTIME_DIR/<app>/<service>.sock` (without it, a `<tmp>/<app>-<uid>` directory that must be the caller's own and closed to others), per-service vsock port
 - single-threaded, `!Send`, `error-stack` errors
 
 ## Hello world
@@ -28,19 +28,24 @@ Server:
 ```rust
 use ogurpchik::auth::handshake::{HandshakeMode, Protocol};
 use ogurpchik::endpoint::Endpoint;
-use ogurpchik::rpc::accept_session;
+use ogurpchik::rpc::SessionAcceptor;
 
 const SCHEMA: Protocol = Protocol::new(0x0123_4567_89ab_cdef, 1, 0, 0);
 
 let endpoint = Endpoint::for_service("myapp", "echo")?;
 let listener = endpoint.listen().await?;
-let session = accept_session::<echo_capnp::echo::Client, _>(
-    &listener,
-    &HandshakeMode::hmac(b"secret".to_vec()),
-    SCHEMA,
-    EchoImpl,
-).await?;
+let mut acceptor = SessionAcceptor::new(&listener, HandshakeMode::hmac(b"secret".to_vec()), SCHEMA);
+loop {
+    let session = acceptor.next::<echo_capnp::echo::Client, _>(EchoImpl).await?;
+    compio::runtime::spawn(async move { session.wait().await }).detach();
+}
 ```
+
+`SessionAcceptor` runs handshakes side by side, up to `max_pending` at once and
+each within `handshake_deadline`, and hands out only sessions that passed; a
+client that connects and says nothing costs one slot, not the listener. Serve
+each session on its own task. `accept_session`, which handshakes inline, is
+deprecated for that reason.
 
 Client:
 

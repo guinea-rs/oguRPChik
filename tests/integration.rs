@@ -7,7 +7,7 @@ use ogurpchik::auth::handshake::{
 use ogurpchik::endpoint::Endpoint;
 use ogurpchik::error::{HandshakeError, RpcError};
 use ogurpchik::net::{Conn, Listener};
-use ogurpchik::rpc::{RpcSession, Side, spawn_session};
+use ogurpchik::rpc::{RpcSession, SessionAcceptor, Side, spawn_session};
 use capnp::capability::Rc;
 
 struct EchoImpl;
@@ -33,9 +33,10 @@ fn hmac() -> HandshakeMode {
 }
 
 async fn serve_one(listener: &Listener) -> RpcSession<echo::Client> {
-    ogurpchik::rpc::accept_session(listener, &hmac(), SCHEMA, EchoImpl)
+    SessionAcceptor::new(listener, hmac(), SCHEMA)
+        .next(EchoImpl)
         .await
-        .expect("accept_session failed")
+        .expect("accept failed")
 }
 
 async fn connect_client(conn: Conn) -> RpcSession<echo::Client> {
@@ -91,7 +92,7 @@ async fn tcp_full_stack() {
 
 #[compio::test]
 async fn tcp_facade_roundtrip() {
-    use ogurpchik::rpc::{accept_session, connect_session};
+    use ogurpchik::rpc::connect_session;
 
     let endpoint = Endpoint::Tcp("127.0.0.1:0".parse().unwrap());
     let listener = endpoint.listen().await.expect("listen failed");
@@ -103,9 +104,10 @@ async fn tcp_facade_roundtrip() {
     let newer = Protocol::new(SCHEMA.id, 1, 2, 0);
 
     let server_task = compio::runtime::spawn(async move {
-        let session = accept_session::<echo::Client, _>(&listener, &hmac(), SCHEMA, EchoImpl)
+        let session = SessionAcceptor::new(&listener, hmac(), SCHEMA)
+            .next::<echo::Client, _>(EchoImpl)
             .await
-            .expect("accept_session failed");
+            .expect("accept failed");
         assert_eq!(session.peer_version(), Some(newer.version));
         compio::time::timeout(std::time::Duration::from_secs(5), session.wait())
             .await
@@ -122,6 +124,7 @@ async fn tcp_facade_roundtrip() {
 }
 
 #[compio::test]
+#[allow(deprecated)]
 async fn facade_surfaces_an_incompatible_major() {
     use ogurpchik::rpc::{accept_session, connect_session};
 
@@ -159,6 +162,88 @@ async fn facade_surfaces_an_incompatible_major() {
     ));
 }
 
+async fn tcp_listener() -> (Listener, std::net::SocketAddr) {
+    let listener = Listener::bind_tcp("127.0.0.1:0".parse().unwrap())
+        .await
+        .expect("bind failed");
+    let Listener::Tcp(inner) = &listener else {
+        unreachable!()
+    };
+    let addr = inner.local_addr().unwrap();
+    (listener, addr)
+}
+
+#[compio::test]
+async fn a_silent_client_does_not_hold_up_the_next() {
+    let (listener, addr) = tcp_listener().await;
+    let server_task = compio::runtime::spawn(async move {
+        let mut acceptor = SessionAcceptor::new(&listener, hmac(), SCHEMA);
+        let session = acceptor.next::<echo::Client, _>(EchoImpl).await.expect("accept failed");
+        assert_eq!(acceptor.pending(), 1, "the silent client is still waiting");
+        compio::time::timeout(std::time::Duration::from_secs(5), session.wait())
+            .await
+            .ok();
+    });
+
+    let _silent = Conn::connect_tcp(addr).await.expect("connect failed");
+    let started = std::time::Instant::now();
+    let session = connect_client(Conn::connect_tcp(addr).await.expect("connect failed")).await;
+    assert_eq!(ping(&session, "after").await, "echo after");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+    drop(session);
+    server_task.await.unwrap();
+}
+
+#[compio::test]
+async fn a_failed_handshake_is_skipped() {
+    let (listener, addr) = tcp_listener().await;
+    let server_task = compio::runtime::spawn(async move {
+        let session = SessionAcceptor::new(&listener, hmac(), SCHEMA)
+            .next::<echo::Client, _>(EchoImpl)
+            .await
+            .expect("accept failed");
+        compio::time::timeout(std::time::Duration::from_secs(5), session.wait())
+            .await
+            .ok();
+    });
+
+    let mut wrong = Conn::connect_tcp(addr).await.expect("connect failed");
+    let _refused = authenticate_client(&mut wrong, &HandshakeMode::hmac(b"wrong".to_vec()), SCHEMA)
+        .await
+        .expect_err("the wrong secret is refused");
+    let session = connect_client(Conn::connect_tcp(addr).await.expect("connect failed")).await;
+    assert_eq!(ping(&session, "right").await, "echo right");
+    drop(session);
+    server_task.await.unwrap();
+}
+
+#[compio::test]
+async fn past_the_limit_a_connection_is_dropped_and_a_stalled_one_times_out() {
+    let (listener, addr) = tcp_listener().await;
+    let server_task = compio::runtime::spawn(async move {
+        let mut acceptor = SessionAcceptor::new(&listener, hmac(), SCHEMA)
+            .max_pending(1)
+            .handshake_deadline(std::time::Duration::from_millis(300));
+        let session = acceptor.next::<echo::Client, _>(EchoImpl).await.expect("accept failed");
+        compio::time::timeout(std::time::Duration::from_secs(5), session.wait())
+            .await
+            .ok();
+    });
+
+    let _silent = Conn::connect_tcp(addr).await.expect("connect failed");
+    compio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut dropped = Conn::connect_tcp(addr).await.expect("connect failed");
+    let _dropped = authenticate_client(&mut dropped, &hmac(), SCHEMA)
+        .await
+        .expect_err("the connection past the limit is dropped");
+
+    compio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let session = connect_client(Conn::connect_tcp(addr).await.expect("connect failed")).await;
+    assert_eq!(ping(&session, "later").await, "echo later");
+    drop(session);
+    server_task.await.unwrap();
+}
+
 #[compio::test]
 async fn uds_full_stack() {
     let path = std::env::temp_dir().join(format!("ogurpchik-it-{}.sock", std::process::id()));
@@ -183,7 +268,18 @@ async fn npipe_full_stack() {
 #[compio::test]
 async fn vsock_loopback_full_stack() {
     const PORT: u32 = 22468;
-    let listener = Listener::bind_vsock_loopback(PORT).expect("bind failed");
+    let listener = match Listener::bind_vsock_loopback(PORT) {
+        Ok(listener) => listener,
+        Err(report)
+            if report
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(ogurpchik::net::vsock::is_unavailable) =>
+        {
+            eprintln!("skipped: no vsock loopback on this host");
+            return;
+        }
+        Err(report) => panic!("bind failed: {report:?}"),
+    };
     full_stack_ping_pong(listener, async move {
         Conn::connect_vsock_loopback(PORT)
             .await

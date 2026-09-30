@@ -74,7 +74,12 @@ impl Display for NamedPipePath {
 
 pub struct NamedPipeAcceptor {
     path: NamedPipePath,
-    current: Arc<Mutex<NamedPipeServer>>,
+    instances: Arc<Mutex<Instances>>,
+}
+
+struct Instances {
+    listening: NamedPipeServer,
+    spare: Option<NamedPipeServer>,
 }
 
 /// Security descriptor applied to every pipe instance we create.
@@ -330,7 +335,10 @@ impl NamedPipeAcceptor {
         let server = Self::create_server(&path, true)?;
         Ok(Self {
             path,
-            current: Arc::new(Mutex::new(server)),
+            instances: Arc::new(Mutex::new(Instances {
+                listening: server,
+                spare: None,
+            })),
         })
     }
 
@@ -338,16 +346,16 @@ impl NamedPipeAcceptor {
         self.path.clone()
     }
 
+    /// Cancel-safe: an accept dropped mid-wait keeps both instances, and a
+    /// client that reached either of them is handed out by the next accept.
     pub async fn accept(&self) -> io::Result<NamedPipeStream> {
-        let connected = {
-            let mut guard = self.current.lock().await;
-            let connected = guard.clone();
-            let next = Self::create_server(&self.path, false)?;
-            *guard = next;
-            connected
-        };
-
-        connected.connect().await?;
+        let mut instances = self.instances.lock().await;
+        if instances.spare.is_none() {
+            instances.spare = Some(Self::create_server(&self.path, false)?);
+        }
+        instances.listening.connect().await?;
+        let spare = instances.spare.take().expect("created above");
+        let connected = std::mem::replace(&mut instances.listening, spare);
         Ok(NamedPipeStream::Server(connected))
     }
 }
@@ -414,5 +422,43 @@ mod tests {
             res.expect("server read failed");
             assert_eq!(buf.as_slice(), expected.as_slice());
         }
+    }
+
+    async fn exchange(mut server: NamedPipeStream, mut client: NamedPipeStream) {
+        let BufResult(res, _) = client.write_all(b"ping").await;
+        res.expect("client write failed");
+        let BufResult(res, buf) = server.read_exact(vec![0u8; 4]).await;
+        res.expect("server read failed");
+        assert_eq!(buf, b"ping");
+    }
+
+    #[compio::test]
+    async fn an_accept_dropped_mid_wait_loses_no_client() {
+        let acceptor = NamedPipeAcceptor::bind(pipe_name("cancel"))
+            .await
+            .expect("bind failed");
+        let endpoint = acceptor.local_addr().to_string();
+        let wait = std::time::Duration::from_millis(50);
+
+        assert!(compio::time::timeout(wait, acceptor.accept()).await.is_err());
+        let client = connect(endpoint.clone()).await.expect("connect after a dropped accept");
+        let server = acceptor.accept().await.expect("the waiting client is handed out");
+        exchange(server, client).await;
+
+        assert!(compio::time::timeout(wait, acceptor.accept()).await.is_err());
+        let (server, client) =
+            futures::try_join!(acceptor.accept(), connect(endpoint.clone())).expect("join failed");
+        exchange(server, client).await;
+
+        let mut pending = Box::pin(acceptor.accept());
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        let client = connect(endpoint).await.expect("connect while an accept waits");
+        drop(pending);
+        compio::time::timeout(std::time::Duration::from_secs(5), async {
+            let server = acceptor.accept().await.expect("the client of the dropped accept");
+            exchange(server, client).await;
+        })
+        .await
+        .expect("the client of the dropped accept was lost");
     }
 }

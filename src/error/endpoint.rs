@@ -8,6 +8,7 @@ pub enum EndpointError {
     UnsupportedOnPlatform,
     NoRuntimeDirectory,
     WslNotRunning,
+    WslVmAmbiguous,
 }
 
 impl fmt::Display for EndpointError {
@@ -20,6 +21,7 @@ impl fmt::Display for EndpointError {
             }
             Self::NoRuntimeDirectory => f.write_str("no usable runtime directory"),
             Self::WslNotRunning => f.write_str("no running WSL VM"),
+            Self::WslVmAmbiguous => f.write_str("cannot tell the WSL VM from the others"),
         }
     }
 }

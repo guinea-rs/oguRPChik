@@ -137,32 +137,74 @@ fn wsl_vm(vms: &[ComputeSystem]) -> Option<Uuid> {
         .find_map(ComputeSystem::vm_id)
 }
 
-pub fn get_wsl_vmid_by_reg() -> std::io::Result<Option<Uuid>> {
-    let list = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
-        .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\HostComputeService\VolatileStore\ComputeSystem")?;
-    for k in list.enum_keys() {
-        let k = k?;
-        let subkey = list.open_subkey(&k)?;
-        let ty: u32 = match subkey.get_value("ComputeSystemType") {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if ty == 2 {
-            if let Ok(v) = k.parse() {
-                return Ok(Some(v));
-            }
-        }
-    }
-    Ok(None)
+pub(crate) enum WslLookupError {
+    Ambiguous(usize),
+    Io(std::io::Error),
 }
 
-pub fn get_wsl_vmid() -> std::io::Result<Option<Uuid>> {
+impl From<WslLookupError> for std::io::Error {
+    fn from(err: WslLookupError) -> Self {
+        match err {
+            WslLookupError::Ambiguous(count) => std::io::Error::other(format!(
+                "{count} VMs are running and the registry does not say which is WSL's; the HCS query that does needs elevation"
+            )),
+            WslLookupError::Io(err) => err,
+        }
+    }
+}
+
+fn virtual_machines_in_registry() -> std::io::Result<Vec<Uuid>> {
+    let list = match winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+        .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\HostComputeService\VolatileStore\ComputeSystem")
+    {
+        Ok(list) => list,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let mut vms = Vec::new();
+    for k in list.enum_keys() {
+        let k = k?;
+        let Ok(subkey) = list.open_subkey(&k) else {
+            continue;
+        };
+        if subkey.get_value::<u32, _>("ComputeSystemType").ok() == Some(2)
+            && let Ok(id) = k.parse()
+        {
+            vms.push(id);
+        }
+    }
+    Ok(vms)
+}
+
+fn the_only_vm(vms: &[Uuid]) -> Result<Option<Uuid>, WslLookupError> {
+    match vms {
+        [] => Ok(None),
+        [only] => Ok(Some(*only)),
+        several => Err(WslLookupError::Ambiguous(several.len())),
+    }
+}
+
+/// The WSL VM from the registry, which does not name owners: the only running
+/// VM, `None` without one, an error when there are several.
+pub fn get_wsl_vmid_by_reg() -> std::io::Result<Option<Uuid>> {
+    Ok(wsl_vmid_by_reg()?)
+}
+
+fn wsl_vmid_by_reg() -> Result<Option<Uuid>, WslLookupError> {
+    the_only_vm(&virtual_machines_in_registry().map_err(WslLookupError::Io)?)
+}
+
+pub(crate) fn wsl_vmid() -> Result<Option<Uuid>, WslLookupError> {
     match get_wsl_vmid_by_hcs() {
         Ok(v) => return Ok(v),
         Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => (),
-        Err(err) => return Err(err),
+        Err(err) => return Err(WslLookupError::Io(err)),
     }
-    get_wsl_vmid_by_reg()
+    wsl_vmid_by_reg()
+}
+
+pub fn get_wsl_vmid() -> std::io::Result<Option<Uuid>> {
+    Ok(wsl_vmid()?)
 }
 
 #[cfg(test)]
@@ -228,6 +270,15 @@ mod tests {
             wsl(&listing(&[cowork, (WSL, "WSL", WSL)])),
             Some(WSL.parse().unwrap())
         );
+    }
+
+    #[test]
+    fn the_registry_answers_only_when_one_vm_runs() {
+        let wsl: Uuid = WSL.parse().unwrap();
+        let other: Uuid = COWORK_RUNTIME.parse().unwrap();
+        assert!(matches!(the_only_vm(&[]), Ok(None)));
+        assert!(matches!(the_only_vm(&[wsl]), Ok(Some(id)) if id == wsl));
+        assert!(matches!(the_only_vm(&[other, wsl]), Err(WslLookupError::Ambiguous(2))));
     }
 
     #[test]

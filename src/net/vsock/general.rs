@@ -1,3 +1,8 @@
+#![cfg_attr(
+    not(any(windows, target_os = "linux")),
+    allow(unreachable_code, unused_variables, unused_mut)
+)]
+
 use crate::net::Splitable;
 use crate::net::vsock::VsockTarget;
 use compio::BufResult;
@@ -6,13 +11,21 @@ use compio::io::{AsyncRead, AsyncWrite};
 use socket2::SockAddr;
 use std::io;
 
+#[cfg(not(any(windows, target_os = "linux")))]
+fn unsupported() -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, "vsock is only available on Windows and Linux")
+}
+
 #[derive(Clone)]
 pub enum VStream {
     #[cfg(windows)]
     Hv(crate::net::vsock::windows::HvStream),
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     Vsock(crate::net::vsock::linux::VsockStream),
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    Unsupported(std::convert::Infallible),
 }
 
 impl Splitable for VStream {
@@ -20,8 +33,10 @@ impl Splitable for VStream {
         let clone = match &self {
             #[cfg(windows)]
             Self::Hv(s) => Self::Hv(s.clone()),
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             Self::Vsock(s) => Self::Vsock(s.clone()),
+            #[cfg(not(any(windows, target_os = "linux")))]
+            Self::Unsupported(never) => match *never {},
         };
         (clone, self)
     }
@@ -29,17 +44,23 @@ impl Splitable for VStream {
 
 impl VStream {
     pub async fn connect_loopback(port: u32) -> io::Result<Self> {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             Self::connect(VsockTarget::Cid(libc::VMADDR_CID_LOCAL), port).await
         }
-        #[cfg(windows)]
+        #[cfg(not(target_os = "linux"))]
         {
             Self::connect(VsockTarget::Cid(1), port).await
         }
     }
     pub async fn connect(target: VsockTarget, port: u32) -> io::Result<Self> {
-        #[cfg(unix)]
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            let _ = (target, port);
+            Err(unsupported())
+        }
+
+        #[cfg(target_os = "linux")]
         {
             let cid = match target {
                 VsockTarget::Cid(c) => c,
@@ -85,8 +106,11 @@ impl AsyncRead for VStream {
             #[cfg(windows)]
             Self::Hv(s) => s.read(buf).await,
 
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             Self::Vsock(s) => s.read(buf).await,
+
+            #[cfg(not(any(windows, target_os = "linux")))]
+            Self::Unsupported(never) => match *never {},
         }
     }
 }
@@ -97,8 +121,11 @@ impl AsyncWrite for VStream {
             #[cfg(windows)]
             Self::Hv(s) => s.write(buf).await,
 
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             Self::Vsock(s) => s.write(buf).await,
+
+            #[cfg(not(any(windows, target_os = "linux")))]
+            Self::Unsupported(never) => match *never {},
         }
     }
 
@@ -107,8 +134,11 @@ impl AsyncWrite for VStream {
             #[cfg(windows)]
             Self::Hv(s) => s.write_vectored(buf).await,
 
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             Self::Vsock(s) => s.write_vectored(buf).await,
+
+            #[cfg(not(any(windows, target_os = "linux")))]
+            Self::Unsupported(never) => match *never {},
         }
     }
 
@@ -117,8 +147,11 @@ impl AsyncWrite for VStream {
             #[cfg(windows)]
             Self::Hv(s) => s.flush().await,
 
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             Self::Vsock(s) => s.flush().await,
+
+            #[cfg(not(any(windows, target_os = "linux")))]
+            Self::Unsupported(never) => match *never {},
         }
     }
 
@@ -127,8 +160,11 @@ impl AsyncWrite for VStream {
             #[cfg(windows)]
             Self::Hv(s) => s.shutdown().await,
 
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             Self::Vsock(s) => s.shutdown().await,
+
+            #[cfg(not(any(windows, target_os = "linux")))]
+            Self::Unsupported(never) => match *never {},
         }
     }
 }
@@ -136,8 +172,10 @@ impl AsyncWrite for VStream {
 pub enum VListener {
     #[cfg(windows)]
     Hv(crate::net::vsock::windows::HvListener),
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     Vsock(crate::net::vsock::linux::VsockListener),
+    #[cfg(not(any(windows, target_os = "linux")))]
+    Unsupported(std::convert::Infallible),
 }
 
 impl VListener {
@@ -148,7 +186,12 @@ impl VListener {
                 target, port,
             )?))
         }
-        #[cfg(unix)]
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            let _ = (target, port);
+            Err(unsupported())
+        }
+        #[cfg(target_os = "linux")]
         {
             let _ = target;
             Ok(Self::Vsock(
@@ -165,7 +208,12 @@ impl VListener {
                 port,
             )?))
         }
-        #[cfg(unix)]
+        #[cfg(not(any(windows, target_os = "linux")))]
+        {
+            let _ = port;
+            Err(unsupported())
+        }
+        #[cfg(target_os = "linux")]
         {
             Ok(Self::Vsock(
                 crate::net::vsock::linux::VsockListener::bind_loopback(port)?,
@@ -180,11 +228,13 @@ impl VListener {
                 let (stream, addr) = l.accept().await?;
                 Ok((VStream::Hv(stream), addr))
             }
-            #[cfg(unix)]
+            #[cfg(target_os = "linux")]
             Self::Vsock(l) => {
                 let (stream, addr) = l.accept().await?;
                 Ok((VStream::Vsock(stream), addr))
             }
+            #[cfg(not(any(windows, target_os = "linux")))]
+            Self::Unsupported(never) => match *never {},
         }
     }
 }
@@ -196,9 +246,22 @@ mod tests {
 
     const TEST_PORT: u32 = 12345;
 
+    fn loopback_or_skip(port: u32) -> Option<VListener> {
+        match VListener::bind_loopback(port) {
+            Ok(listener) => Some(listener),
+            Err(err) if crate::net::vsock::is_unavailable(&err) => {
+                eprintln!("skipped: no vsock loopback on this host: {err}");
+                None
+            }
+            Err(err) => panic!("bind failed: {err}"),
+        }
+    }
+
     #[compio::test]
     async fn test_stream_full_cycle() {
-        let listener = VListener::bind_loopback(TEST_PORT).expect("Failed to bind listener");
+        let Some(listener) = loopback_or_skip(TEST_PORT) else {
+            return;
+        };
 
         let client_task = async {
             let mut client = VStream::connect_loopback(TEST_PORT)
@@ -232,7 +295,9 @@ mod tests {
 
     #[compio::test]
     async fn test_stream_split() {
-        let listener = VListener::bind_loopback(TEST_PORT + 1).expect("Bind failed");
+        let Some(listener) = loopback_or_skip(TEST_PORT + 1) else {
+            return;
+        };
 
         let client_fut = async {
             let stream = VStream::connect_loopback(TEST_PORT + 1).await.unwrap();

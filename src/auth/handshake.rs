@@ -32,13 +32,30 @@ const ACK_REJECTED: u8 = 1;
 
 type HmacSha256 = Hmac<Sha256>;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub enum HandshakeMode {
     #[default]
     Disabled,
     VersionOnly,
     HmacSha256 { secret: Rc<[u8]> },
     SignedProcess { public_key: Rc<[u8]> },
+}
+
+impl std::fmt::Debug for HandshakeMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Disabled => f.write_str("Disabled"),
+            Self::VersionOnly => f.write_str("VersionOnly"),
+            Self::HmacSha256 { secret } => f
+                .debug_struct("HmacSha256")
+                .field("secret", &format_args!("<{} bytes>", secret.len()))
+                .finish(),
+            Self::SignedProcess { public_key } => f
+                .debug_struct("SignedProcess")
+                .field("public_key", public_key)
+                .finish(),
+        }
+    }
 }
 
 impl HandshakeMode {
@@ -545,6 +562,14 @@ mod tests {
     use crate::net::Listener;
 
     const SCHEMA: Protocol = Protocol::new(0x5eed, 1, 0, 0);
+
+    #[test]
+    fn debug_output_does_not_carry_the_secret() {
+        let shown = format!("{:?}", HandshakeMode::hmac(b"hunter2-hunter2".to_vec()));
+        assert!(!shown.contains("104"), "{shown}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("15 bytes"), "{shown}");
+    }
 
     async fn tcp_pair() -> (Conn, Conn) {
         let listener = Listener::bind_tcp("127.0.0.1:0".parse().unwrap())

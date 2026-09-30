@@ -2,7 +2,7 @@ use capnp::capability::Rc;
 use ogurpchik::auth::handshake::{HandshakeMode, Protocol};
 use ogurpchik::endpoint::Endpoint;
 use ogurpchik::net::vsock::VsockTarget;
-use ogurpchik::rpc::{accept_session, connect_session};
+use ogurpchik::rpc::{SessionAcceptor, connect_session};
 use testschema::echo_capnp::echo;
 
 const SCHEMA: Protocol = Protocol::new(0xec40, 1, 0, 0);
@@ -42,9 +42,10 @@ async fn main() {
             };
             let listener = endpoint.listen().await.expect("listen failed");
             println!("listening on vsock port {port} ({})", endpoint.kind());
-            let session = accept_session::<echo::Client, _>(&listener, &handshake, SCHEMA, EchoImpl)
+            let session = SessionAcceptor::new(&listener, handshake, SCHEMA)
+                .next::<echo::Client, _>(EchoImpl)
                 .await
-                .expect("accept_session failed");
+                .expect("accept failed");
             println!("peer connected and authenticated, serving");
             let _ = session.wait().await;
             println!("session ended");

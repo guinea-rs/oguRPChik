@@ -105,7 +105,18 @@ async fn npipe_carries_heavy_traffic_both_ways() {
 #[compio::test]
 async fn vsock_loopback_carries_heavy_traffic_both_ways() {
     const PORT: u32 = 22469;
-    let listener = Listener::bind_vsock_loopback(PORT).expect("bind failed");
+    let listener = match Listener::bind_vsock_loopback(PORT) {
+        Ok(listener) => listener,
+        Err(report)
+            if report
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(ogurpchik::net::vsock::is_unavailable) =>
+        {
+            eprintln!("skipped: no vsock loopback on this host");
+            return;
+        }
+        Err(report) => panic!("bind failed: {report:?}"),
+    };
     let (server, client) = futures::try_join!(listener.accept(), Conn::connect_vsock_loopback(PORT))
         .expect("join failed");
     heavy_traffic_both_ways(server, client).await;

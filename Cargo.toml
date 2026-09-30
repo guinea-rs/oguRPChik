@@ -1,7 +1,8 @@
 [package]
 name = "ogurpchik"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
+rust-version = "1.95"
 authors = ["ignatternyev54@gmail.com"]
 license = "MIT"
 description = "Host <-> VM-agent and host <-> plugin RPC over vsock/uds/npipe, with capnp-rpc on top of a compio transport."
@@ -58,7 +59,7 @@ winapi = { version = "0.3.9", features = ["libloaderapi", "combaseapi", "minwind
 rustix = { version = "1.1", features = ["net", "time"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "1.0.0-alpha.2"
+libc = "0.2"
 
 [profile.release]
 split-debuginfo = "packed"

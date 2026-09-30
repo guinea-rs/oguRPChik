@@ -11,7 +11,11 @@ use crate::net::npipe::NamedPipeAcceptor;
 
 pub enum Listener {
     Tcp(TcpListener),
-    Uds { listener: UnixListener, path: PathBuf },
+    Uds {
+        listener: UnixListener,
+        path: PathBuf,
+        identity: Option<(u64, u64)>,
+    },
     #[cfg(windows)]
     Npipe(NamedPipeAcceptor),
     Vsock(VListener),
@@ -26,13 +30,19 @@ impl Listener {
             .attach(format!("tcp {addr}"))
     }
 
+    /// Binds `path`, first removing a socket file there that nobody listens on.
+    /// A live socket or any other file at `path` is left alone and refused.
     pub async fn bind_uds(path: &Path) -> Result<Self, Report<TransportError>> {
-        let _ = std::fs::remove_file(path);
+        clear_stale_socket(path)
+            .await
+            .change_context(TransportError::Bind)
+            .attach(format!("uds {}", path.display()))?;
         UnixListener::bind(path)
             .await
             .map(|listener| Self::Uds {
                 listener,
                 path: path.to_path_buf(),
+                identity: file_identity(path),
             })
             .change_context(TransportError::Bind)
             .attach(format!("uds {}", path.display()))
@@ -100,9 +110,55 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        if let Self::Uds { path, .. } = self {
+        if let Self::Uds { path, identity, .. } = self
+            && (cfg!(windows) || (identity.is_some() && file_identity(path) == *identity))
+        {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(windows)]
+fn file_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+#[cfg(unix)]
+fn is_socket_file(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    metadata.file_type().is_socket()
+}
+
+#[cfg(windows)]
+fn is_socket_file(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    !metadata.file_type().is_symlink() && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+async fn clear_stale_socket(path: &Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    if !is_socket_file(&metadata) {
+        return Err(Error::new(
+            ErrorKind::AlreadyExists,
+            "the path holds something other than a socket; not removing it",
+        ));
+    }
+    match compio::net::UnixStream::connect(path).await {
+        Ok(_) => Err(Error::new(ErrorKind::AddrInUse, "a server is listening on this socket")),
+        Err(err) if err.kind() == ErrorKind::ConnectionRefused => std::fs::remove_file(path),
+        Err(err) => Err(err),
     }
 }
 
@@ -164,17 +220,43 @@ mod tests {
         assert!(!path.exists(), "uds socket file should be cleaned up on drop");
     }
 
+    fn uds_path(tag: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("ogurpchik-net-test-{tag}-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
     #[compio::test]
-    async fn uds_rebind_over_stale_socket_file_succeeds() {
-        let path = std::env::temp_dir().join(format!(
-            "ogurpchik-net-test-stale-{}.sock",
-            std::process::id()
-        ));
-        std::fs::write(&path, b"not a socket").expect("write stale file failed");
+    async fn uds_rebind_over_a_stale_socket_succeeds() {
+        let path = uds_path("stale");
+        drop(UnixListener::bind(&path).await.expect("raw bind failed"));
+        assert!(path.exists(), "a dropped raw listener leaves its socket file behind");
 
         let _listener = Listener::bind_uds(&path)
             .await
-            .expect("bind should clean up the stale file and succeed");
+            .expect("bind should clear the stale socket and succeed");
+    }
+
+    #[compio::test]
+    async fn uds_bind_leaves_a_regular_file_alone() {
+        let path = uds_path("regular");
+        std::fs::write(&path, b"not a socket").expect("write failed");
+
+        assert!(Listener::bind_uds(&path).await.is_err());
+        assert_eq!(std::fs::read(&path).expect("the file is still there"), b"not a socket");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[compio::test]
+    async fn uds_bind_refuses_a_live_socket_and_keeps_it() {
+        let path = uds_path("live");
+        let first = Listener::bind_uds(&path).await.expect("first bind failed");
+
+        assert!(Listener::bind_uds(&path).await.is_err());
+        drop(first.accept().await.expect("the second bind's probe"));
+        let (server, client) = futures::try_join!(first.accept(), Conn::connect_uds(&path))
+            .expect("the first listener still serves its path");
+        ping_pong(server, client).await;
     }
 
     #[cfg(windows)]
@@ -194,7 +276,18 @@ mod tests {
     #[compio::test]
     async fn vsock_ping_pong_through_conn_enum() {
         const PORT: u32 = 22345;
-        let listener = Listener::bind_vsock_loopback(PORT).expect("bind failed");
+        let listener = match Listener::bind_vsock_loopback(PORT) {
+            Ok(listener) => listener,
+            Err(report)
+                if report
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(crate::net::vsock::is_unavailable) =>
+            {
+                eprintln!("skipped: no vsock loopback on this host");
+                return;
+            }
+            Err(report) => panic!("bind failed: {report:?}"),
+        };
 
         let accept = listener.accept();
         let connect = Conn::connect_vsock_loopback(PORT);

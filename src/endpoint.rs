@@ -44,11 +44,21 @@ impl Endpoint {
     }
 
     /// The WSL2 VM, or [`EndpointError::WslNotRunning`] when there is none.
+    /// Unelevated with several VMs running, [`EndpointError::WslVmAmbiguous`].
     #[cfg(windows)]
     pub fn vsock_to_wsl(port: u32) -> Result<Self, EndpointError> {
-        let vm = crate::net::vsock::utils::get_wsl_vmid()
-            .change_context(EndpointError::InvalidVsockTarget)?
-            .ok_or_else(|| Report::new(EndpointError::WslNotRunning))?;
+        use crate::net::vsock::utils::{WslLookupError, wsl_vmid};
+        let vm = match wsl_vmid() {
+            Ok(vm) => vm,
+            Err(WslLookupError::Ambiguous(count)) => {
+                return Err(Report::new(EndpointError::WslVmAmbiguous)
+                    .attach(format!("{count} VMs are running; run elevated to tell WSL's apart")));
+            }
+            Err(WslLookupError::Io(err)) => {
+                return Err(Report::new(err).change_context(EndpointError::InvalidVsockTarget));
+            }
+        }
+        .ok_or_else(|| Report::new(EndpointError::WslNotRunning))?;
         Ok(Self::Vsock {
             target: VsockTarget::Guid(vm),
             port,
@@ -163,19 +173,53 @@ fn validate_name(name: &str) -> Result<(), EndpointError> {
 
 #[cfg(not(windows))]
 fn runtime_dir(app: &str) -> Result<PathBuf, EndpointError> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
+    let base = match std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
-        .unwrap_or_else(|| {
+    {
+        Some(xdg) => xdg,
+        None => {
             // SAFETY: getuid has no failure mode.
-            std::env::temp_dir().join(format!("{app}-{}", unsafe { libc::getuid() }))
-        });
+            let uid = unsafe { libc::getuid() };
+            let fallback = std::env::temp_dir().join(format!("{app}-{uid}"));
+            private_dir(&fallback, uid)?;
+            fallback
+        }
+    };
     let dir = base.join(app);
     if let Err(e) = std::fs::create_dir_all(&dir) {
         return Err(Report::new(EndpointError::NoRuntimeDirectory)
             .attach(format!("cannot create {}: {e}", dir.display())));
     }
     Ok(dir)
+}
+
+#[cfg(not(windows))]
+fn private_dir(dir: &std::path::Path, uid: u32) -> Result<(), EndpointError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    let refuse = |why: String| {
+        Err(Report::new(EndpointError::NoRuntimeDirectory).attach(format!("{}: {why}", dir.display())))
+    };
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return refuse(format!("cannot create: {e}")),
+    }
+    let metadata = match std::fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(e) => return refuse(format!("cannot inspect: {e}")),
+    };
+    if !metadata.file_type().is_dir() {
+        return refuse("not a directory".into());
+    }
+    if metadata.uid() != uid {
+        return refuse(format!("owned by uid {}, not {uid}", metadata.uid()));
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return refuse(format!("mode {:o} lets others in", metadata.mode() & 0o777));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -211,6 +255,53 @@ mod tests {
             Endpoint::Uds(path) => assert!(path.ends_with("myapp/metrics.sock")),
             other => panic!("expected uds, got {other}"),
         }
+    }
+
+    #[cfg(not(windows))]
+    fn scratch(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ogurpchik-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn private_dir_is_created_closed_and_accepted_again() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = scratch("private");
+        let uid = unsafe { libc::getuid() };
+        private_dir(&dir, uid).expect("fresh directory");
+        assert_eq!(std::fs::metadata(&dir).unwrap().mode() & 0o077, 0);
+        private_dir(&dir, uid).expect("own private directory again");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn private_dir_refuses_what_others_can_enter() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("open");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let uid = unsafe { libc::getuid() };
+        let report = private_dir(&dir, uid).expect_err("a world-writable directory");
+        assert!(matches!(report.current_context(), EndpointError::NoRuntimeDirectory));
+        let report = private_dir(&dir, uid.wrapping_add(1)).expect_err("someone else's directory");
+        assert!(matches!(report.current_context(), EndpointError::NoRuntimeDirectory));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn private_dir_refuses_a_symlink() {
+        let target = scratch("target");
+        let link = scratch("link");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let uid = unsafe { libc::getuid() };
+        assert!(private_dir(&link, uid).is_err());
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_dir_all(&target).unwrap();
     }
 
     #[compio::test]
@@ -259,7 +350,7 @@ mod tests {
             }
         });
 
-        let mut conn = endpoint
+        let conn = endpoint
             .connect_ready(Duration::from_secs(5))
             .await
             .expect("connect_ready gave up too early");
