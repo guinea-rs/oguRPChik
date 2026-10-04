@@ -96,7 +96,7 @@ impl Conn {
 #[cfg(windows)]
 fn npipe_client_pid(server: &compio::fs::named_pipe::NamedPipeServer) -> PeerIdentity {
     use compio::driver::AsRawFd;
-    use windows::Win32::{GetNamedPipeClientProcessId, HANDLE};
+    use crate::bindings::{GetNamedPipeClientProcessId, HANDLE};
 
     let mut pid = 0u32;
     // SAFETY: the handle is borrowed from the live pipe server; `pid` is a valid out-pointer.

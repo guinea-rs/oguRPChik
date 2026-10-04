@@ -119,7 +119,7 @@ const PIPE_SDDL_TEMPLATE: &str = "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{sid})(A;;F
 /// SID of the account this process runs as, in SDDL string form.
 #[cfg(windows)]
 fn current_user_sid() -> io::Result<String> {
-    use windows::Win32::{
+    use crate::bindings::{
         ConvertSidToStringSidW, GetCurrentProcess, GetTokenInformation, HANDLE, LocalFree,
         OpenProcessToken, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
@@ -164,7 +164,7 @@ fn current_user_sid() -> io::Result<String> {
     // that same allocation, which is alive for the rest of this function.
     let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
 
-    let mut raw = windows::core::PWSTR::null();
+    let mut raw = windows_core::PWSTR::null();
     // SAFETY: `sid` is valid as above; on success the callee allocates the
     // string with LocalAlloc, freed below.
     unsafe {
@@ -183,7 +183,7 @@ fn current_user_sid() -> io::Result<String> {
 }
 
 #[cfg(windows)]
-struct HandleGuard(windows::Win32::HANDLE);
+struct HandleGuard(crate::bindings::HANDLE);
 
 #[cfg(windows)]
 impl Drop for HandleGuard {
@@ -191,7 +191,7 @@ impl Drop for HandleGuard {
         // SAFETY: the handle came from OpenProcessToken and is not used after
         // this point.
         unsafe {
-            let _ = windows::Win32::CloseHandle(self.0);
+            let _ = crate::bindings::CloseHandle(self.0);
         }
     }
 }
@@ -204,13 +204,13 @@ impl Drop for HandleGuard {
 #[cfg(windows)]
 fn apply_pipe_security(server: &NamedPipeServer) -> io::Result<()> {
     use compio::driver::AsRawFd;
-    use windows::Win32::{
+    use crate::bindings::{
         ACL, ConvertStringSecurityDescriptorToSecurityDescriptorW, DACL_SECURITY_INFORMATION,
         GetSecurityDescriptorDacl, GetSecurityDescriptorSacl, HANDLE, LABEL_SECURITY_INFORMATION,
         LocalFree, PSECURITY_DESCRIPTOR, SDDL_REVISION_1, SE_KERNEL_OBJECT, SECURITY_INFORMATION,
         SetSecurityInfo,
     };
-    use windows::core::HSTRING;
+    use windows_core::HSTRING;
 
     let sddl = HSTRING::from(PIPE_SDDL_TEMPLATE.replace("{sid}", &current_user_sid()?));
     let mut descriptor = PSECURITY_DESCRIPTOR::default();

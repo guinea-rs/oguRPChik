@@ -4,11 +4,11 @@ use error_stack::{Report, ResultExt};
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
-use windows::Win32::{
+use crate::bindings::{
     CloseHandle, FILETIME, GetProcessTimes, HANDLE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     QueryFullProcessImageNameW,
 };
-use windows::core::PWSTR;
+use windows_core::PWSTR;
 
 const PROCESS_NAME_WIN32: u32 = 0;
 

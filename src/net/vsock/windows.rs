@@ -9,11 +9,11 @@ use compio::runtime::{Attacher, submit};
 use socket2::{Domain, Protocol, SockAddr, SockAddrStorage, Socket, Type};
 use std::io;
 use std::os::windows::io::{AsRawSocket, FromRawSocket, OwnedSocket};
-use windows::Win32::{
+use crate::bindings::{
     ADDRESS_FAMILY, AF_HYPERV, SD_SEND, SO_UPDATE_ACCEPT_CONTEXT, SOCKADDR, SOCKET, SOCKET_ERROR,
     SOL_SOCKET, SOMAXCONN, bind, listen, setsockopt, shutdown,
 };
-use windows::core::GUID;
+use windows_core::GUID;
 
 #[repr(C)]
 #[allow(non_snake_case)]
